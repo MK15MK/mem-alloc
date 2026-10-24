@@ -21,11 +21,16 @@ void  *ma_memalign(size_t align, size_t n);
 int    ma_posix_memalign(void **out, size_t align, size_t n);
 size_t ma_usable_size(void *p);
 
+/* Return the calling thread's cached small chunks to their arenas. Threads
+ * flush automatically on exit; MA_TCACHE=0 disables the cache entirely. */
+void   ma_tcache_flush(void);
+
 typedef struct ma_stats {
     size_t os_bytes;       /* bytes currently obtained from the OS (heap + mmap) */
     size_t peak_os_bytes;  /* high-water mark of os_bytes */
     size_t heap_bytes;     /* bytes in sbrk/mmap heap segments */
-    size_t inuse_bytes;    /* bytes in allocated heap chunks (incl. headers) */
+    size_t inuse_bytes;    /* bytes in allocated heap chunks (incl. headers),
+                              including chunks parked in thread caches */
     size_t free_bytes;     /* bytes in free heap chunks (bins + top) */
     size_t mmap_bytes;     /* bytes in directly mmapped large chunks */
     size_t mmap_count;     /* number of directly mmapped large chunks */

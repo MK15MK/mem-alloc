@@ -43,6 +43,14 @@ for wl, t in order:
     if g and m:
         print(f"| {wl} | {t} | {g:.1f} | {m:.1f} | {m / g:.2f}x |")
 
+print("\n## Effect of the per-thread cache (million ops/s)\n")
+print("| workload | threads | ma, no tcache | ma, tcache | speedup |")
+print("|---|---:|---:|---:|---:|")
+for wl, t in order:
+    off, on = get("ma-notcache", wl, t, "mops_per_sec"), get("ma", wl, t, "mops_per_sec")
+    if off and on:
+        print(f"| {wl} | {t} | {off:.1f} | {on:.1f} | {on / off:.2f}x |")
+
 print("\n## Per-arena locks vs a single global lock (million ops/s)\n")
 print("| workload | threads | ma, 1 arena | ma, per-CPU arenas | speedup |")
 print("|---|---:|---:|---:|---:|")
@@ -52,8 +60,8 @@ for wl, t in [("threads", t) for t in (1, 2, 4, 8)] + [("xthread", t) for t in (
         print(f"| {wl} | {t} | {one:.1f} | {many:.1f} | {many / one:.2f}x |")
 
 print("\n## Fragmentation trace (64 MiB live peak, lower is better)\n")
-print("| metric | glibc | ma |")
-print("|---|---:|---:|")
+print("| metric | glibc | ma | ma, no tcache |")
+print("|---|---:|---:|---:|")
 labels = [
     ("peak_footprint_mib", "peak footprint (MiB from OS)", "{:.1f}"),
     ("footprint_over_live_at_peaks", "footprint / live bytes, at peaks", "{:.3f}"),
@@ -65,6 +73,7 @@ labels = [
     ("seconds", "trace run time (s)", "{:.2f}"),
 ]
 for key, label, fmt in labels:
-    g, m = get("glibc", "frag", 1, key), get("ma", "frag", 1, key)
+    g, m, n = (get(a, "frag", 1, key) for a in ("glibc", "ma", "ma-notcache"))
     if g is not None and m is not None:
-        print(f"| {label} | {fmt.format(g)} | {fmt.format(m)} |")
+        nt = fmt.format(n) if n is not None else "-"
+        print(f"| {label} | {fmt.format(g)} | {fmt.format(m)} | {nt} |")

@@ -86,6 +86,28 @@ arena's **top chunk** (the wilderness at the end of the heap).
 * `pthread_atfork` handlers hold all arena locks across `fork()`, so a child
   never inherits a heap that is half-modified.
 
+### Per-thread cache (tcache)
+
+In front of the arenas, each thread keeps a small LIFO cache of freed small
+chunks (32-1008 bytes): up to 8 per size class, in initial-exec TLS.
+
+* **Fast paths.** A cached `malloc` or `free` is a few pointer operations and
+  takes no lock.
+* **Refill.** On a cache miss the thread takes its arena lock anyway. While it
+  holds the lock, it also moves up to 4 more chunks of the same size from the
+  exact bin into the cache.
+* **Accounting.** Cached chunks keep their in-use bit. The arenas, the byte
+  counters and `ma_check` see them as allocated, so none of the arena
+  invariants change.
+* **Double-free detection.** A cached chunk's `bk` word holds a per-process
+  cookie. Freeing a chunk that carries the cookie triggers a scan of that
+  cache bin, and a real double free aborts with
+  `double free detected in tcache`.
+* **Thread exit.** A pthread-key destructor drains the cache when its thread
+  exits. `ma_tcache_flush()` drains the calling thread's cache on demand.
+* **Switch.** `MA_TCACHE=0` turns the cache off, which the benchmarks use for
+  comparison.
+
 ### realloc, memalign, calloc
 
 * **realloc** tries these in order:
@@ -187,59 +209,78 @@ The test suite covers:
   arenas and with 1
 * `fork`
 * a forced mmap-only mode (`MA_NO_SBRK=1`)
+* the thread cache: LIFO reuse, accounting, draining on thread exit, and
+  aborting on a double free
+* the whole suite again with the cache off (`MA_TCACHE=0`)
 
 ## Results
 
 Median of 5 runs on 12 vCPUs (i5-13420H, WSL2 kernel 6.6), gcc 13.3,
 glibc 2.39. Full tables: [bench/RESULTS.md](bench/RESULTS.md). Benchmark
 bookkeeping comes straight from `mmap`, so neither allocator pays for it.
+Absolute numbers move with host load, so compare ratios from the same run.
 
 | workload (Mops/s) | glibc | ma | ma / glibc |
 |---|---:|---:|---:|
-| small blocks, 1 thread | 51.8 | 23.5 | 0.45x |
-| mixed sizes, 1 thread | 14.9 | 16.3 | 1.09x |
-| realloc growth, 1 thread | 1.0 | 1.1 | 1.12x |
-| mixed, 8 threads (private) | 87.4 | 77.8 | 0.89x |
-| producer→consumer, 2 threads | 2.6 | 10.5 | **3.98x** |
-| producer→consumer, 8 threads | 9.1 | 22.0 | **2.41x** |
+| small blocks, 1 thread | 39.5 | 49.1 | **1.24x** |
+| mixed sizes, 1 thread | 13.0 | 18.2 | **1.40x** |
+| realloc growth, 1 thread | 0.7 | 1.5 | **2.23x** |
+| mixed, 8 threads (private) | 82.3 | 100.4 | **1.22x** |
+| producer→consumer, 2 threads | 3.1 | 8.4 | **2.69x** |
+| producer→consumer, 8 threads | 8.9 | 24.4 | **2.75x** |
 
-Per-arena locks compared with a single global lock (`MA_ARENAS=1`):
-**5.9x at 2 threads, 18.8x at 4, 58x at 8** on private workloads, and
-8.9x on the 8-thread producer/consumer workload.
+What each layer contributes, measured on `ma` itself:
+
+* **Per-thread cache** (`MA_TCACHE=0` compared with the default):
+  * **2.3x** on single-thread small blocks
+  * 1.3-1.5x on mixed and multithreaded workloads
+  * 1.33x on the 8-thread producer/consumer workload
+* **Per-arena locks** (`MA_ARENAS=1` compared with the default):
+  * **5.1x at 2 threads, 21x at 4, 50x at 8** on private workloads
+  * 8.6x on the 8-thread producer/consumer workload
 
 Fragmentation trace: the heap fills to 64 MiB live, frees random blocks down
 to 16 MiB, and repeats 20 times with a size distribution that shifts each
 round.
 
-| | glibc | ma |
-|---|---:|---:|
-| peak footprint / live bytes | 1.108 | 1.109 |
-| peak RSS (MiB) | 78.5 | 78.8 |
-| footprint after freeing everything | 70.9 MiB | **0.13 MiB** |
-| trace run time | 1.59 s | 1.13 s |
+| | glibc | ma | ma, no tcache |
+|---|---:|---:|---:|
+| peak footprint / live bytes | 1.108 | 1.109 | 1.109 |
+| peak RSS (MiB) | 78.6 | 78.8 | 78.6 |
+| footprint after freeing everything | 70.9 MiB | 71.0 MiB | **0.13 MiB** |
+| trace run time | 1.69 s | 1.43 s | 1.29 s |
 
 **What the numbers say:**
 
+* **Throughput:** with the cache, `ma` beats glibc on every workload here.
+  * Small-block speed is about the same as glibc's tcache, plus a 1.24x edge.
+  * Mixed sizes are 1.4x: the bitmap bin search and eager coalescing pay off
+    once requests miss the cache.
+  * Cross-thread frees are about 2.7x: a remote free costs one lock on the
+    owner's arena.
 * **Fragmentation:** `ma` matches glibc almost exactly. Both are best-fit
-  boundary-tag allocators. `ma` coalesces eagerly and trims, so it hands
-  memory back to the OS as soon as the heap empties. glibc keeps its 71 MiB
-  because tcache and fastbin chunks stay uncoalesced.
-* **Cross-thread frees:** `ma` is 2.4-4x faster. A remote free in `ma` is one
-  lock on the owner's arena, while glibc's path through tcache, fastbins and
-  arena locks is costlier.
-* **Single-thread small blocks:** `ma` is 0.45x glibc. glibc's *tcache* is a
-  per-thread, lock-free cache in front of its arenas, so a small
-  malloc/free pair never touches a mutex. Every `ma` operation takes its
-  arena lock, even when uncontended. The same cost explains the 0.89x on 8
-  private threads.
+  boundary-tag allocators.
+* **Releasing memory:** the cache costs this. Chunks parked in the main
+  thread's cache sit right below the top chunk and stop the trim, so like
+  glibc, `ma` keeps its 71 MiB after the heap empties.
+  * With the cache off, eager coalescing and trimming return all but
+    0.13 MiB.
+  * Calling `ma_tcache_flush()` gets the same result while keeping the cache
+    on.
 
 ## Limitations / next steps
 
-* **A per-thread cache** of small chunks in front of the arenas, like
-  tcache, is the obvious way to close the single-thread small-block gap.
-* Free chunks inside the heap are never `madvise(MADV_DONTNEED)`'d. Only the
-  top chunk and empty mmap segments go back to the OS.
-* An emptied sbrk segment that is no longer at the end of the break cannot be
-  released.
-* `do_free` reads the header's `INUSE` bit before taking the lock, as a cheap
-  sanity check. That is a benign race, but ThreadSanitizer would flag it.
+* **Trimming and the cache.** Cached chunks can pin the top of the heap. A
+  smarter policy would skip caching chunks that border the top chunk, or
+  drain the cache when the top chunk could otherwise be trimmed.
+* **Double-free detection** only scans the freeing thread's own cache. A
+  chunk freed twice from two different threads is not caught, a limitation
+  glibc shares.
+* **madvise.** Free chunks inside the heap are never
+  `madvise(MADV_DONTNEED)`'d. Only the top chunk and empty mmap segments go
+  back to the OS.
+* **sbrk segments.** An emptied sbrk segment that is no longer at the end of
+  the break cannot be released.
+* **ThreadSanitizer.** `do_free` reads the header's `INUSE` bit before taking
+  the lock, as a cheap sanity check. That is a benign race, but
+  ThreadSanitizer would flag it.

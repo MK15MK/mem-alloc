@@ -95,6 +95,7 @@ int main(void)
         if (p)
             check_and_free(p);
     }
+    ma_tcache_flush();   /* blocks freed here sit in main's cache */
 
     ma_stats_t st;
     ma_get_stats(&st);

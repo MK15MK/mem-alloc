@@ -78,6 +78,7 @@
 #define TRIM_THRESHOLD  (256 * 1024)    /* trim top when it exceeds this... */
 #define TOP_KEEP        (128 * 1024)    /* ...keeping this much             */
 #define LARGE_SCAN_MAX  32              /* best-fit scan limit per bin      */
+#define TCACHE_COUNT    8               /* cached chunks per size class     */
 
 /* ------------------------------------------------------------------------ */
 /* Chunks                                                                   */
@@ -191,6 +192,25 @@ static atomic_size_t g_os_bytes, g_peak_os_bytes, g_mmap_bytes, g_mmap_count;
 
 static __thread arena_t *tls_arena __attribute__((tls_model("initial-exec")));
 
+/* Per-thread cache of small chunks (32..1008 bytes), one LIFO list per small
+ * bin, consulted before any arena lock is taken. Cached chunks stay marked
+ * in use, so to the arenas (and ma_check) they look allocated. A cached
+ * chunk's bk word holds tcache_cookie so double frees can be detected. */
+enum { TC_UNINIT, TC_ON, TC_OFF };
+
+typedef struct tcache {
+    int state;
+    uint8_t count[NSMALL];
+    chunk_t *head[NSMALL];
+} tcache_t;
+
+static __thread tcache_t tcache __attribute__((tls_model("initial-exec")));
+static int tcache_enabled = 1;
+static pthread_key_t tcache_key;
+static uintptr_t tcache_cookie;
+
+static void tcache_thread_exit(void *arg);
+
 /* ------------------------------------------------------------------------ */
 /* Diagnostics (no stdio: must not allocate while holding arena locks)      */
 /* ------------------------------------------------------------------------ */
@@ -277,6 +297,13 @@ static void ma_init(void)
         arenas[i].id = i;
     }
     pthread_atfork(atfork_prepare, atfork_release, atfork_release);
+
+    env = getenv("MA_TCACHE");
+    if (env && env[0] == '0')
+        tcache_enabled = 0;
+    if (pthread_key_create(&tcache_key, tcache_thread_exit) != 0)
+        tcache_enabled = 0;
+    tcache_cookie = ((uintptr_t)&tcache_key ^ ((uintptr_t)getpid() << 32)) * 0x9E3779B97F4A7C15ull | 1;
 }
 
 /* Lock the calling thread's arena. If it is contended, try the others and
@@ -651,6 +678,83 @@ static void mmap_free(chunk_t *c)
 /* Internal entry points (no valgrind annotations)                          */
 /* ------------------------------------------------------------------------ */
 
+static inline arena_t *owner_of(chunk_t *c)
+{
+    unsigned id = c_arena(c);
+    if (id >= narenas)
+        corruption("free(): invalid pointer", c2mem(c));
+    return &arenas[id];
+}
+
+/* The calling thread's cache, or NULL if caching is off for this thread. */
+static inline tcache_t *tc_get(void)
+{
+    tcache_t *tc = &tcache;
+    if (__builtin_expect(tc->state == TC_ON, 1))
+        return tc;
+    if (tc->state == TC_OFF)
+        return NULL;
+    pthread_once(&init_once, ma_init);
+    if (!tcache_enabled) {
+        tc->state = TC_OFF;
+        return NULL;
+    }
+    tc->state = TC_ON;        /* before setspecific, which may allocate */
+    pthread_setspecific(tcache_key, tc);
+    return tc;
+}
+
+static inline void tc_push(tcache_t *tc, unsigned i, chunk_t *c)
+{
+    c->fd = tc->head[i];
+    c->bk = (chunk_t *)tcache_cookie;
+    tc->head[i] = c;
+    tc->count[i]++;
+}
+
+/* Move up to half a cache's worth of same-size chunks from the arena's exact
+ * bin into the cache while we hold the lock anyway. */
+static void tc_refill(arena_t *a, tcache_t *tc, size_t nb)
+{
+    unsigned i = bin_index(nb);
+    chunk_t *c;
+    while (tc->count[i] < TCACHE_COUNT / 2 && (c = a->bins[i]) != NULL) {
+        bin_unlink(a, c);
+        c->head |= F_INUSE;
+        c_next(c)->head |= F_PREV_INUSE;
+        a->inuse_bytes += nb;
+        tc_push(tc, i, c);
+    }
+}
+
+/* Return every cached chunk to its owning arena. */
+static void tc_drain(tcache_t *tc)
+{
+    for (unsigned i = 0; i < NSMALL; i++) {
+        chunk_t *c;
+        while ((c = tc->head[i]) != NULL) {
+            tc->head[i] = c->fd;
+            tc->count[i]--;
+            c->bk = NULL;
+            arena_t *a = owner_of(c);
+            pthread_mutex_lock(&a->lock);
+            arena_free(a, c);
+            pthread_mutex_unlock(&a->lock);
+        }
+    }
+}
+
+/* pthread key destructor: a thread's cache dies with it. Caching stays off
+ * for any allocations later destructors make on this thread. */
+static void tcache_thread_exit(void *arg)
+{
+    tcache_t *tc = arg;
+    tc->state = TC_OFF;
+    VG_ENTER();
+    tc_drain(tc);
+    VG_LEAVE();
+}
+
 static void *do_malloc(size_t n)
 {
     size_t nb;
@@ -664,22 +768,27 @@ static void *do_malloc(size_t n)
             errno = ENOMEM;
         return p;
     }
+    tcache_t *tc = nb < SMALL_LIMIT ? tc_get() : NULL;
+    if (tc) {
+        unsigned i = bin_index(nb);
+        chunk_t *c = tc->head[i];
+        if (c) {
+            tc->head[i] = c->fd;
+            tc->count[i]--;
+            c->bk = NULL;
+            return c2mem(c);
+        }
+    }
     arena_t *a = lock_my_arena();
     chunk_t *c = arena_alloc(a, nb);
+    if (c && tc)
+        tc_refill(a, tc, nb);
     pthread_mutex_unlock(&a->lock);
     if (!c) {
         errno = ENOMEM;
         return NULL;
     }
     return c2mem(c);
-}
-
-static inline arena_t *owner_of(chunk_t *c)
-{
-    unsigned id = c_arena(c);
-    if (id >= narenas)
-        corruption("free(): invalid pointer", c2mem(c));
-    return &arenas[id];
 }
 
 static void do_free(void *p)
@@ -690,6 +799,21 @@ static void do_free(void *p)
     if (c_mmapped(c)) {
         mmap_free(c);
         return;
+    }
+    size_t sz = csize(c);
+    tcache_t *tc = sz < SMALL_LIMIT ? tc_get() : NULL;
+    if (tc) {
+        unsigned i = bin_index(sz);
+        if ((uintptr_t)c->bk == tcache_cookie) {
+            /* Probably already cached: confirm before calling it a bug. */
+            for (chunk_t *e = tc->head[i]; e; e = e->fd)
+                if (e == c)
+                    corruption("free(): double free detected in tcache", p);
+        }
+        if (tc->count[i] < TCACHE_COUNT) {
+            tc_push(tc, i, c);
+            return;
+        }
     }
     arena_t *a = owner_of(c);
     pthread_mutex_lock(&a->lock);
@@ -919,6 +1043,15 @@ int ma_posix_memalign(void **out, size_t align, size_t n)
         return ENOMEM;
     *out = p;
     return 0;
+}
+
+void ma_tcache_flush(void)
+{
+    if (tcache.state != TC_ON)
+        return;
+    VG_ENTER();
+    tc_drain(&tcache);
+    VG_LEAVE();
 }
 
 size_t ma_usable_size(void *p)

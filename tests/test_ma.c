@@ -3,6 +3,9 @@
 #include "ma.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,6 +104,7 @@ static void test_calloc(void)
 /* Freeing three neighbours in any order must leave one merged chunk. */
 static void test_coalesce(void)
 {
+    ma_tcache_flush();                        /* start from arena-only state */
     char *a = ma_malloc(100), *b = ma_malloc(100), *c = ma_malloc(100);
     char *guard = ma_malloc(100);
     size_t chunk = (size_t)(b - a);
@@ -108,6 +112,7 @@ static void test_coalesce(void)
     ma_free(a);
     ma_free(c);
     ma_free(b);
+    ma_tcache_flush();                        /* hand the three back to the arena */
     HEAP_OK();
     char *m = ma_malloc(3 * chunk - 8);       /* exactly the merged chunk */
     EXPECT(m == a);
@@ -119,6 +124,7 @@ static void test_coalesce(void)
 /* A big free chunk must be split, handing back its front. */
 static void test_split(void)
 {
+    ma_tcache_flush();
     char *big = ma_malloc(8000);
     char *guard = ma_malloc(16);
     ma_free(big);
@@ -148,9 +154,9 @@ static void test_realloc(void)
     HEAP_OK();
 
     /* Growing the most recent chunk extends into top in place. */
-    char *last = ma_malloc(256);
+    char *last = ma_malloc(100000);           /* too big for any free chunk */
     fill(last, 256, 5);
-    char *grown = ma_realloc(last, 20000);
+    char *grown = ma_realloc(last, 120000);
 #ifndef MA_VALGRIND
     EXPECT(grown == last);
 #endif
@@ -160,6 +166,7 @@ static void test_realloc(void)
     char *x = ma_malloc(200), *y = ma_malloc(200), *g = ma_malloc(16);
     fill(x, 200, 6);
     ma_free(y);
+    ma_tcache_flush();                        /* y must reach the arena to be absorbed */
     char *x2 = ma_realloc(x, 350);
 #ifndef MA_VALGRIND
     EXPECT(x2 == x);
@@ -236,6 +243,7 @@ static void test_trim(void)
     EXPECT(s1.heap_bytes >= (size_t)N * 1000);
     for (int i = N; i-- > 0;)
         ma_free(p[i]);
+    ma_tcache_flush();
     ma_get_stats(&s2);
     EXPECT(s2.heap_bytes < s1.heap_bytes - N * 900);
     HEAP_OK();
@@ -284,10 +292,72 @@ static void test_stress(void)
         ma_free(p[k]);
         p[k] = NULL;
     }
+    ma_tcache_flush();
     HEAP_OK();
     ma_stats_t st;
     ma_get_stats(&st);
     EXPECT(st.inuse_bytes == 0 || st.inuse_bytes < 64 * 1024);  /* earlier tests' leftovers */
+}
+
+static void *tcache_thread(void *arg)
+{
+    (void)arg;
+    void *p[64];
+    for (int i = 0; i < 64; i++)
+        p[i] = ma_malloc((size_t)(i % 16) * 60 + 1);
+    for (int i = 0; i < 64; i++)
+        ma_free(p[i]);                        /* most land in this thread's cache */
+    return NULL;
+}
+
+static void test_tcache(void)
+{
+    if (getenv("MA_TCACHE") && getenv("MA_TCACHE")[0] == '0')
+        return;
+    /* LIFO reuse without touching the arena. */
+    void *a = ma_malloc(48);
+    ma_free(a);
+    EXPECT(ma_malloc(48) == a);
+    ma_free(a);
+
+    /* Cached chunks still count as in use; flushing gives them back. */
+    ma_tcache_flush();
+    ma_stats_t s0, s1, s2;
+    ma_get_stats(&s0);
+    void *b[8];
+    for (int i = 0; i < 8; i++)
+        b[i] = ma_malloc(200);
+    for (int i = 0; i < 8; i++)
+        ma_free(b[i]);
+    ma_get_stats(&s1);
+    EXPECT(s1.inuse_bytes == s0.inuse_bytes + 8 * 208);
+    HEAP_OK();
+    ma_tcache_flush();
+    ma_get_stats(&s2);
+    EXPECT(s2.inuse_bytes == s0.inuse_bytes);
+    HEAP_OK();
+
+    /* A thread's cache is drained when it exits. */
+    pthread_t t;
+    pthread_create(&t, NULL, tcache_thread, NULL);
+    pthread_join(t, NULL);
+    ma_get_stats(&s1);
+    EXPECT(s1.inuse_bytes == s0.inuse_bytes);
+
+#ifndef MA_VALGRIND   /* memcheck itself reports the double free first */
+    /* Freeing a cached chunk again must abort, not corrupt the cache. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(open("/dev/null", O_WRONLY), 2);   /* expected abort message */
+        void *d = ma_malloc(64);
+        ma_free(d);
+        ma_free(d);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    EXPECT(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+#endif
 }
 
 static void test_fork(void)
@@ -319,6 +389,7 @@ int main(int argc, char **argv)
     test_large_mmap();
     test_trim();
     test_stress();
+    test_tcache();
     test_fork();
     if (failures) {
         printf("test_ma: %d failure(s)\n", failures);

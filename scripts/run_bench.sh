@@ -26,6 +26,13 @@ for alloc in glibc ma; do
     for t in 2 4 8; do run "$alloc" X=1 -- "$alloc" xthread "$t"; done
     run "$alloc" X=1 -- "$alloc" frag
 done
+# Same allocator without the per-thread cache: what does the tcache buy?
+run "ma-notcache" MA_TCACHE=0 -- ma small
+run "ma-notcache" MA_TCACHE=0 -- ma mixed
+run "ma-notcache" MA_TCACHE=0 -- ma realloc
+for t in 1 2 4 8; do run "ma-notcache" MA_TCACHE=0 -- ma threads "$t"; done
+for t in 2 4 8; do run "ma-notcache" MA_TCACHE=0 -- ma xthread "$t"; done
+run "ma-notcache" MA_TCACHE=0 -- ma frag
 # Same allocator with a single arena: what do per-arena locks buy?
 for t in 1 2 4 8; do run "ma-1arena" MA_ARENAS=1 -- ma threads "$t"; done
 for t in 2 4 8; do run "ma-1arena" MA_ARENAS=1 -- ma xthread "$t"; done

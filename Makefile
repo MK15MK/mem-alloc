@@ -50,6 +50,8 @@ test: $(B)/test_ma $(B)/test_threads $(B)/libma.so
 	./$(B)/test_threads
 	MA_ARENAS=1 ./$(B)/test_threads
 	MA_NO_SBRK=1 ./$(B)/test_ma
+	MA_TCACHE=0 ./$(B)/test_ma
+	MA_TCACHE=0 ./$(B)/test_threads
 	./scripts/preload_test.sh
 
 # memcheck with the allocator's client requests: should be error-free...
